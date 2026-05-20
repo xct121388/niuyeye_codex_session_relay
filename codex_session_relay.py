@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
 import hashlib
 import json
 import os
@@ -824,10 +825,15 @@ class CodexRelayHandler(BaseHTTPRequestHandler):
             self.end_headers()
             if body:
                 self.wfile.write(body)
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
+            log_entry["status"] = 502
+            log_entry["error"] = sanitize_error(str(exc))
+            self.write_error_json(HTTPStatus.BAD_GATEWAY, "upstream_error", f"上游请求失败: {log_entry['error']}")
+            print(f"[relay] 上游连接失败: {log_entry['error']}", file=sys.stderr)
         except Exception as exc:
             log_entry["status"] = 502
             log_entry["error"] = sanitize_error(str(exc))
-            self.write_error_json(HTTPStatus.BAD_GATEWAY, "upstream_error", "上游请求失败")
+            self.write_error_json(HTTPStatus.BAD_GATEWAY, "upstream_error", f"上游请求失败: {log_entry['error']}")
             traceback.print_exc()
         finally:
             log_entry["duration_ms"] = elapsed_ms(started_at)
@@ -841,6 +847,9 @@ class CodexRelayHandler(BaseHTTPRequestHandler):
             if lower in PASS_REQUEST_HEADERS and value.strip():
                 headers[key] = value
         headers["Authorization"] = "Bearer " + session["access_token"]
+        account_id = string_value(session.get("account_id"))
+        if account_id:
+            headers["chatgpt-account-id"] = account_id
         headers.setdefault("OpenAI-Beta", "responses=experimental")
         headers.setdefault("originator", "codex_cli_rs")
         headers.setdefault("Accept", "text/event-stream")
@@ -1048,6 +1057,189 @@ def choose_mono_font() -> tuple[str, int]:
     return ("Courier New", 10)
 
 
+class WindowsTrayIcon:
+    """使用 Windows 通知区托盘图标控制窗口显示。"""
+
+    WM_TRAY = 0x0400 + 20
+    ID_RESTORE = 1001
+    ID_EXIT = 1002
+    MF_STRING = 0x0000
+    TPM_RIGHTBUTTON = 0x0002
+
+    def __init__(self, app: "RelayDesktopApp") -> None:
+        self.app = app
+        self.thread: threading.Thread | None = None
+        self.ready = threading.Event()
+        self.hwnd = 0
+        self.visible = False
+        self.nid: Any = None
+        self.wndproc: Any = None
+        self.user32: Any = None
+        self.shell32: Any = None
+
+    def show(self) -> None:
+        """显示托盘图标。"""
+        if self.visible:
+            return
+        if self.thread is None:
+            self.thread = threading.Thread(target=self.run_message_window, daemon=True)
+            self.thread.start()
+        if not self.ready.wait(2) or not self.hwnd:
+            raise RuntimeError("托盘窗口初始化失败")
+        if not self.shell32.Shell_NotifyIconW(0, ctypes.byref(self.nid)):
+            raise RuntimeError("托盘图标添加失败")
+        self.visible = True
+
+    def hide(self) -> None:
+        """移除托盘图标。"""
+        if self.visible and self.shell32 and self.nid:
+            self.shell32.Shell_NotifyIconW(2, ctypes.byref(self.nid))
+            self.visible = False
+
+    def close(self) -> None:
+        """关闭托盘图标和消息窗口。"""
+        self.hide()
+        if self.user32 and self.hwnd:
+            self.user32.PostMessageW(self.hwnd, 0x0010, 0, 0)
+
+    def run_message_window(self) -> None:
+        """创建隐藏消息窗口并接收托盘事件。"""
+        from ctypes import wintypes
+
+        self.user32 = ctypes.windll.user32
+        self.shell32 = ctypes.windll.shell32
+        hinstance = ctypes.windll.kernel32.GetModuleHandleW(None)
+
+        LRESULT = ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [
+                ("style", wintypes.UINT),
+                ("lpfnWndProc", WNDPROC),
+                ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE),
+                ("hIcon", wintypes.HICON),
+                ("hCursor", wintypes.HCURSOR),
+                ("hbrBackground", wintypes.HBRUSH),
+                ("lpszMenuName", wintypes.LPCWSTR),
+                ("lpszClassName", wintypes.LPCWSTR),
+            ]
+
+        class NOTIFYICONDATAW(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("hWnd", wintypes.HWND),
+                ("uID", wintypes.UINT),
+                ("uFlags", wintypes.UINT),
+                ("uCallbackMessage", wintypes.UINT),
+                ("hIcon", wintypes.HICON),
+                ("szTip", ctypes.c_wchar * 128),
+                ("dwState", wintypes.DWORD),
+                ("dwStateMask", wintypes.DWORD),
+                ("szInfo", ctypes.c_wchar * 256),
+                ("uVersion", wintypes.UINT),
+                ("szInfoTitle", ctypes.c_wchar * 64),
+                ("dwInfoFlags", wintypes.DWORD),
+                ("guidItem", ctypes.c_byte * 16),
+                ("hBalloonIcon", wintypes.HICON),
+            ]
+
+        def wndproc(hwnd: int, msg: int, wparam: int, lparam: int) -> int:
+            if msg == self.WM_TRAY:
+                if lparam in (0x0202, 0x0203):
+                    self.app.root.after(0, self.app.show_from_tray)
+                elif lparam == 0x0205:
+                    self.show_menu(hwnd)
+                return 0
+            if msg == 0x0111:
+                command = wparam & 0xFFFF
+                if command == self.ID_RESTORE:
+                    self.app.root.after(0, self.app.show_from_tray)
+                elif command == self.ID_EXIT:
+                    self.app.root.after(0, self.app.exit_app)
+                return 0
+            if msg == 0x0002:
+                self.user32.PostQuitMessage(0)
+                return 0
+            return self.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        class_name = "CodexSessionRelayTrayWindow"
+        self.wndproc = WNDPROC(wndproc)
+        self.user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        self.user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.HWND,
+            wintypes.HMENU,
+            wintypes.HINSTANCE,
+            wintypes.LPVOID,
+        ]
+        self.user32.CreateWindowExW.restype = wintypes.HWND
+        self.user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        self.user32.DefWindowProcW.restype = LRESULT
+        self.user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+        self.user32.LoadIconW.restype = wintypes.HICON
+        self.user32.CreatePopupMenu.restype = wintypes.HMENU
+        self.user32.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_size_t, wintypes.LPCWSTR]
+        self.user32.TrackPopupMenu.argtypes = [
+            wintypes.HMENU,
+            wintypes.UINT,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.HWND,
+            wintypes.LPVOID,
+        ]
+        self.user32.DestroyMenu.argtypes = [wintypes.HMENU]
+        self.user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        self.user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+        self.shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = self.wndproc
+        wc.hInstance = hinstance
+        wc.lpszClassName = class_name
+        self.user32.RegisterClassW(ctypes.byref(wc))
+        self.hwnd = self.user32.CreateWindowExW(0, class_name, class_name, 0, 0, 0, 0, 0, None, None, hinstance, None)
+        hicon = self.user32.LoadIconW(None, ctypes.cast(32512, wintypes.LPCWSTR))
+        nid = NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        nid.hWnd = self.hwnd
+        nid.uID = 1
+        nid.uFlags = 1 | 2 | 4
+        nid.uCallbackMessage = self.WM_TRAY
+        nid.hIcon = hicon
+        nid.szTip = "Codex Session Relay"
+        self.nid = nid
+        self.ready.set()
+
+        msg = wintypes.MSG()
+        while self.user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            self.user32.TranslateMessage(ctypes.byref(msg))
+            self.user32.DispatchMessageW(ctypes.byref(msg))
+
+    def show_menu(self, hwnd: int) -> None:
+        """显示托盘右键菜单。"""
+        import ctypes
+        from ctypes import wintypes
+
+        menu = self.user32.CreatePopupMenu()
+        self.user32.AppendMenuW(menu, self.MF_STRING, self.ID_RESTORE, "显示窗口")
+        self.user32.AppendMenuW(menu, self.MF_STRING, self.ID_EXIT, "退出程序")
+        point = wintypes.POINT()
+        self.user32.GetCursorPos(ctypes.byref(point))
+        self.user32.SetForegroundWindow(hwnd)
+        self.user32.TrackPopupMenu(menu, self.TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd, None)
+        self.user32.DestroyMenu(menu)
+
+
 class RelayDesktopApp:
     """Tkinter 桌面展示和后台代理控制。"""
 
@@ -1071,6 +1263,7 @@ class RelayDesktopApp:
         self.account_options: dict[str, str] = {}
         self.base_url_var = tk.StringVar(value=f"本地代理 {self.base_url}")
         self.refresh_after_id: str | None = None
+        self.tray_icon: WindowsTrayIcon | None = None
         self.build_ui()
 
     def run(self) -> None:
@@ -1242,6 +1435,7 @@ class RelayDesktopApp:
     def open_settings(self) -> None:
         """打开设置窗口。"""
         self.root.deiconify()
+        self.root.lift()
         SettingsWindow(self)
 
     def import_to_ccswitch(self) -> None:
@@ -1286,7 +1480,6 @@ class RelayDesktopApp:
 
     def refresh_usage_done(self) -> None:
         """刷新限额成功后更新界面。"""
-        self.message_var.set("限额已刷新")
         self.refresh(schedule=False)
 
     def refresh_usage_failed(self, message: str, silent: bool = False) -> None:
@@ -1377,15 +1570,39 @@ class RelayDesktopApp:
             self.settings["close_action"] = close_action
             save_settings(self.store_path, self.settings)
         if close_action == CLOSE_ACTION_MINIMIZE:
-            self.root.iconify()
+            self.hide_to_tray()
             return
         self.exit_app()
+
+    def hide_to_tray(self) -> None:
+        """隐藏主窗口到系统托盘。"""
+        if sys.platform.startswith("win"):
+            try:
+                if self.tray_icon is None:
+                    self.tray_icon = WindowsTrayIcon(self)
+                self.tray_icon.show()
+                self.root.withdraw()
+                return
+            except Exception as exc:
+                messagebox.showerror("隐藏失败", f"无法创建托盘图标：{exc}")
+        self.root.iconify()
+
+    def show_from_tray(self) -> None:
+        """从系统托盘恢复主窗口。"""
+        if self.tray_icon is not None:
+            self.tray_icon.hide()
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
 
     def exit_app(self) -> None:
         """退出窗口和后台代理服务。"""
         if self.refresh_after_id is not None:
             self.root.after_cancel(self.refresh_after_id)
             self.refresh_after_id = None
+        if self.tray_icon is not None:
+            self.tray_icon.close()
+            self.tray_icon = None
         self.server.shutdown()
         self.server.server_close()
         self.root.destroy()
@@ -1553,7 +1770,7 @@ class CloseChoiceDialog:
 
         actions = ttk.Frame(outer)
         actions.pack(fill=tk.X)
-        ttk.Button(actions, text="最小化", style="Tool.TButton", command=lambda: self.choose(CLOSE_ACTION_MINIMIZE)).pack(side=tk.LEFT)
+        ttk.Button(actions, text="隐藏到托盘", style="Tool.TButton", command=lambda: self.choose(CLOSE_ACTION_MINIMIZE)).pack(side=tk.LEFT)
         ttk.Button(actions, text="退出程序", style="Primary.TButton", command=lambda: self.choose(CLOSE_ACTION_EXIT)).pack(side=tk.LEFT, padx=(10, 0))
 
     def center_over_parent(self) -> None:
@@ -1620,7 +1837,7 @@ class SettingsWindow:
         close_box = ttk.Frame(outer)
         close_box.grid(row=2, column=1, sticky="w", pady=(0, 10))
         ttk.Checkbutton(close_box, text="直接退出程序", variable=self.exit_on_close_var, command=lambda: self.select_close_action(CLOSE_ACTION_EXIT)).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(close_box, text="最小化窗口", variable=self.minimize_on_close_var, command=lambda: self.select_close_action(CLOSE_ACTION_MINIMIZE)).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(close_box, text="隐藏到系统托盘", variable=self.minimize_on_close_var, command=lambda: self.select_close_action(CLOSE_ACTION_MINIMIZE)).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
         actions = ttk.Frame(outer)
         actions.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12, 0))
