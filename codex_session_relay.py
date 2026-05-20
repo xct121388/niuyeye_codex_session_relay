@@ -52,6 +52,8 @@ LEGACY_SETTINGS_FILE = "relay_settings.json"
 STARTUP_RUN_NAME = "CodexSessionRelay"
 CLOSE_ACTION_EXIT = "exit"
 CLOSE_ACTION_MINIMIZE = "minimize"
+ICON_ICO_FILES = ("logo.ico", "app.ico", "codex_session_relay.ico")
+ICON_IMAGE_FILES = ("logo.png", "app.png", "codex_session_relay.png")
 
 PASS_REQUEST_HEADERS = {
     "user-agent",
@@ -1057,6 +1059,15 @@ def choose_mono_font() -> tuple[str, int]:
     return ("Courier New", 10)
 
 
+def find_existing_file(base_dir: str, names: tuple[str, ...]) -> str:
+    """按候选文件名查找项目内图标文件。"""
+    for name in names:
+        path = os.path.join(base_dir, name)
+        if os.path.exists(path):
+            return path
+    return ""
+
+
 class WindowsTrayIcon:
     """使用 Windows 通知区托盘图标控制窗口显示。"""
 
@@ -1073,6 +1084,7 @@ class WindowsTrayIcon:
         self.hwnd = 0
         self.visible = False
         self.nid: Any = None
+        self.icon = 0
         self.wndproc: Any = None
         self.user32: Any = None
         self.shell32: Any = None
@@ -1101,6 +1113,9 @@ class WindowsTrayIcon:
         self.hide()
         if self.user32 and self.hwnd:
             self.user32.PostMessageW(self.hwnd, 0x0010, 0, 0)
+        if self.user32 and self.icon:
+            self.user32.DestroyIcon(self.icon)
+            self.icon = 0
 
     def run_message_window(self) -> None:
         """创建隐藏消息窗口并接收托盘事件。"""
@@ -1185,8 +1200,26 @@ class WindowsTrayIcon:
         self.user32.CreateWindowExW.restype = wintypes.HWND
         self.user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
         self.user32.DefWindowProcW.restype = LRESULT
-        self.user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
-        self.user32.LoadIconW.restype = wintypes.HICON
+        self.user32.CreateIcon.argtypes = [
+            wintypes.HINSTANCE,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_ubyte,
+            ctypes.c_ubyte,
+            ctypes.POINTER(ctypes.c_ubyte),
+            ctypes.POINTER(ctypes.c_ubyte),
+        ]
+        self.user32.CreateIcon.restype = wintypes.HICON
+        self.user32.LoadImageW.argtypes = [
+            wintypes.HINSTANCE,
+            wintypes.LPCWSTR,
+            wintypes.UINT,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        self.user32.LoadImageW.restype = wintypes.HICON
+        self.user32.DestroyIcon.argtypes = [wintypes.HICON]
         self.user32.CreatePopupMenu.restype = wintypes.HMENU
         self.user32.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_size_t, wintypes.LPCWSTR]
         self.user32.TrackPopupMenu.argtypes = [
@@ -1208,14 +1241,14 @@ class WindowsTrayIcon:
         wc.lpszClassName = class_name
         self.user32.RegisterClassW(ctypes.byref(wc))
         self.hwnd = self.user32.CreateWindowExW(0, class_name, class_name, 0, 0, 0, 0, 0, None, None, hinstance, None)
-        hicon = self.user32.LoadIconW(None, ctypes.cast(32512, wintypes.LPCWSTR))
+        self.icon = self.create_icon(hinstance)
         nid = NOTIFYICONDATAW()
         nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
         nid.hWnd = self.hwnd
         nid.uID = 1
         nid.uFlags = 1 | 2 | 4
         nid.uCallbackMessage = self.WM_TRAY
-        nid.hIcon = hicon
+        nid.hIcon = self.icon
         nid.szTip = "Codex Session Relay"
         self.nid = nid
         self.ready.set()
@@ -1239,6 +1272,32 @@ class WindowsTrayIcon:
         self.user32.TrackPopupMenu(menu, self.TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd, None)
         self.user32.DestroyMenu(menu)
 
+    def create_icon(self, hinstance: int) -> int:
+        """创建 Relay 自定义托盘图标。"""
+        if self.app.icon_ico_path:
+            icon = self.user32.LoadImageW(None, self.app.icon_ico_path, 1, 0, 0, 0x00000010 | 0x00000040)
+            if icon:
+                return icon
+        size = 32
+        pixels = bytearray()
+        for y in range(size - 1, -1, -1):
+            for x in range(size):
+                if x in (0, size - 1) or y in (0, size - 1):
+                    color = (17, 24, 39)
+                elif 7 <= x <= 24 and 7 <= y <= 24:
+                    color = (15, 108, 189)
+                elif 11 <= x <= 20 and 11 <= y <= 20:
+                    color = (255, 255, 255)
+                else:
+                    color = (243, 244, 246)
+                if 19 <= x <= 26 and 19 <= y <= 26:
+                    color = (16, 185, 129)
+                r, g, b = color
+                pixels.extend((b, g, r, 255))
+        xor_bits = (ctypes.c_ubyte * len(pixels)).from_buffer_copy(bytes(pixels))
+        and_bits = (ctypes.c_ubyte * (size * size // 8))()
+        return self.user32.CreateIcon(hinstance, size, size, 1, 32, and_bits, xor_bits)
+
 
 class RelayDesktopApp:
     """Tkinter 桌面展示和后台代理控制。"""
@@ -1251,11 +1310,16 @@ class RelayDesktopApp:
         self.store_path = store_path
         self.settings = dict(settings)
         self.base_url = f"http://{host}:{port}"
+        self.app_dir = os.path.dirname(os.path.abspath(__file__))
+        self.icon_ico_path = find_existing_file(self.app_dir, ICON_ICO_FILES)
+        self.icon_image_path = find_existing_file(self.app_dir, ICON_IMAGE_FILES)
+        self.window_icon_image: tk.PhotoImage | None = None
         self.root = tk.Tk()
         self.root.title("Codex Session Relay")
         self.root.geometry("980x650")
         self.root.minsize(860, 560)
         self.root.configure(bg="#f3f4f6")
+        self.set_window_icon(self.root)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.status_vars: dict[str, tk.StringVar] = {}
@@ -1263,12 +1327,25 @@ class RelayDesktopApp:
         self.account_options: dict[str, str] = {}
         self.base_url_var = tk.StringVar(value=f"本地代理 {self.base_url}")
         self.refresh_after_id: str | None = None
-        self.tray_icon: WindowsTrayIcon | None = None
+        self.tray_icon = WindowsTrayIcon(self) if sys.platform.startswith("win") else None
         self.build_ui()
+
+    def set_window_icon(self, window: tk.Tk | tk.Toplevel) -> None:
+        """设置窗口左上角和任务栏图标。"""
+        try:
+            if self.icon_ico_path and sys.platform.startswith("win"):
+                window.iconbitmap(default=self.icon_ico_path)
+            elif self.icon_image_path:
+                if self.window_icon_image is None:
+                    self.window_icon_image = tk.PhotoImage(file=self.icon_image_path)
+                window.iconphoto(True, self.window_icon_image)
+        except tk.TclError as exc:
+            print(f"[relay] 窗口图标加载失败: {exc}", file=sys.stderr)
 
     def run(self) -> None:
         """启动后台代理并进入桌面窗口。"""
         self.server_thread.start()
+        self.show_tray_icon()
         self.refresh(schedule=True)
         self.refresh_usage_on_start()
         self.root.mainloop()
@@ -1307,14 +1384,12 @@ class RelayDesktopApp:
         style.configure("Status.TLabel", font=(ui_font[0], 10, "bold"), foreground="#0f6cbd")
         style.configure("Primary.TButton", font=(ui_font[0], 10, "bold"), padding=(9, 4))
         style.configure("Tool.TButton", padding=(7, 3))
-        style.configure("Treeview", rowheight=22, font=(ui_font[0], 9))
-        style.configure("Treeview.Heading", font=(ui_font[0], 9, "bold"))
 
         outer = ttk.Frame(self.root, padding=8)
         outer.pack(fill=tk.BOTH, expand=True)
         outer.columnconfigure(0, weight=5)
         outer.columnconfigure(1, weight=3)
-        outer.rowconfigure(1, weight=1)
+        outer.rowconfigure(1, weight=0)
         outer.rowconfigure(2, weight=1)
 
         header = ttk.Frame(outer)
@@ -1332,7 +1407,7 @@ class RelayDesktopApp:
         ttk.Button(command_bar, text="刷新限额", style="Tool.TButton", command=self.refresh_usage).grid(row=0, column=3)
 
         import_box = self.create_card(outer)
-        import_box.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        import_box.grid(row=1, column=0, rowspan=2, sticky="nsew", padx=(0, 8))
         import_box.rowconfigure(1, weight=1)
         import_box.columnconfigure(0, weight=1)
         ttk.Label(import_box, text="获取并粘贴 api/auth/session", style="Section.TLabel").grid(row=0, column=0, sticky="w")
@@ -1372,7 +1447,7 @@ class RelayDesktopApp:
         ttk.Label(status_box, textvariable=self.ccswitch_var, style="Subtitle.TLabel").grid(row=9, column=0, columnspan=2, sticky="w")
 
         config_box = self.create_card(outer)
-        config_box.grid(row=2, column=0, sticky="nsew", padx=(0, 8), pady=(8, 0))
+        config_box.grid(row=2, column=1, sticky="nsew", pady=(8, 0))
         config_box.rowconfigure(2, weight=1)
         config_box.columnconfigure(0, weight=1)
         ttk.Label(config_box, text="Codex CLI 配置", style="Section.TLabel").grid(row=0, column=0, sticky="w")
@@ -1388,24 +1463,6 @@ class RelayDesktopApp:
             text.grid(row=0, column=0, sticky="nsew")
             self.config_texts[key] = text
             self.config_tabs.add(frame, text=title)
-
-        log_box = self.create_card(outer)
-        log_box.grid(row=2, column=1, sticky="nsew", pady=(8, 0))
-        log_box.rowconfigure(1, weight=1)
-        log_box.columnconfigure(0, weight=1)
-        ttk.Label(log_box, text="最近代理请求", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 5))
-        columns = ("time", "path", "status", "duration", "error")
-        self.log_table = ttk.Treeview(log_box, columns=columns, show="headings", height=8)
-        for col, width, text in [
-            ("time", 150, "时间"),
-            ("path", 180, "路径"),
-            ("status", 60, "状态"),
-            ("duration", 70, "耗时"),
-            ("error", 180, "错误"),
-        ]:
-            self.log_table.heading(col, text=text)
-            self.log_table.column(col, width=width, anchor="w")
-        self.log_table.grid(row=1, column=0, sticky="nsew")
 
     def create_card(self, parent: ttk.Frame) -> ttk.Frame:
         """创建统一留白的内容面板。"""
@@ -1466,7 +1523,6 @@ class RelayDesktopApp:
 
     def refresh_usage(self) -> None:
         """主动请求上游刷新 Codex 限额。"""
-        self.message_var.set("正在刷新限额...")
         threading.Thread(target=self.refresh_usage_worker, daemon=True).start()
 
     def refresh_usage_worker(self, silent: bool = False) -> None:
@@ -1518,16 +1574,6 @@ class RelayDesktopApp:
             text.delete("1.0", tk.END)
             text.insert("1.0", config.get(key, ""))
 
-        for row in self.log_table.get_children():
-            self.log_table.delete(row)
-        for item in data.get("logs", []):
-            self.log_table.insert("", tk.END, values=(
-                item.get("time", ""),
-                item.get("path", ""),
-                item.get("status", ""),
-                f"{item.get('duration_ms', 0)}ms",
-                item.get("error", ""),
-            ))
         if schedule:
             self.refresh_after_id = self.root.after(3000, self.refresh, True)
 
@@ -1576,21 +1622,24 @@ class RelayDesktopApp:
 
     def hide_to_tray(self) -> None:
         """隐藏主窗口到系统托盘。"""
-        if sys.platform.startswith("win"):
-            try:
-                if self.tray_icon is None:
-                    self.tray_icon = WindowsTrayIcon(self)
-                self.tray_icon.show()
-                self.root.withdraw()
-                return
-            except Exception as exc:
-                messagebox.showerror("隐藏失败", f"无法创建托盘图标：{exc}")
+        if self.show_tray_icon():
+            self.root.withdraw()
+            return
         self.root.iconify()
+
+    def show_tray_icon(self) -> bool:
+        """确保系统托盘图标可见。"""
+        if self.tray_icon is None:
+            return False
+        try:
+            self.tray_icon.show()
+            return True
+        except Exception as exc:
+            print(f"[relay] 托盘图标初始化失败: {exc}", file=sys.stderr)
+            return False
 
     def show_from_tray(self) -> None:
         """从系统托盘恢复主窗口。"""
-        if self.tray_icon is not None:
-            self.tray_icon.hide()
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
@@ -1617,6 +1666,7 @@ class AccountEditorWindow:
         self.selected_key = ""
         self.accounts: dict[str, str] = {}
         self.window = tk.Toplevel(app.root)
+        app.set_window_icon(self.window)
         self.window.title("编辑账号")
         self.window.geometry("1080x560")
         self.window.minsize(980, 500)
@@ -1751,6 +1801,7 @@ class CloseChoiceDialog:
         self.app = app
         self.result = ""
         self.window = tk.Toplevel(app.root)
+        app.set_window_icon(self.window)
         self.window.title("关闭方式")
         self.window.geometry("360x170")
         self.window.resizable(False, False)
@@ -1803,6 +1854,7 @@ class SettingsWindow:
     def __init__(self, app: RelayDesktopApp) -> None:
         self.app = app
         self.window = tk.Toplevel(app.root)
+        app.set_window_icon(self.window)
         self.window.title("设置")
         self.window.geometry("460x290")
         self.window.minsize(420, 260)
