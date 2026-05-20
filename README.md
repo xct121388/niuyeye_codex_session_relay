@@ -1,5 +1,11 @@
 # Codex Session Relay
 
+## 我打下广告 提供稳定的优质ai资源
+牛爷爷的AI小站:https://pay.ldxp.cn/shop/EIPG9I9L  小猫GPT源头:https://pay.ldxp.cn/shop/1D0LD6BR
+
+感谢关注, 谢谢喵
+
+## 介绍
 Codex Session Relay 是一个本地代理工具，用来把浏览器里的 ChatGPT 登录态导入到本机，并让 Codex CLI 通过本地地址转发请求到 ChatGPT Codex。
 
 主要功能：
