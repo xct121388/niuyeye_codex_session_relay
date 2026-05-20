@@ -1,2 +1,11 @@
 __pycache__/
 *.json
+.venv-build/
+.python312/
+.python312-full/
+build/
+dist/
+*.spec
+*.nupkg
+*.zip
+python-*.exe
