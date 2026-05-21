@@ -6,7 +6,7 @@
 感谢关注, 谢谢喵
 
 ## 介绍
-Codex Session Relay 是一个本地代理工具，用来把浏览器里的 ChatGPT 登录态导入到本机，并让 Codex CLI 通过本地地址转发请求到 ChatGPT Codex。
+Codex Session Relay 是一个本地代理工具，把浏览器里的 ChatGPT 登录态导入到本机，可让 Codex CLI 通过本地地址转发请求到 ChatGPT Codex。
 
 主要功能：
 
@@ -57,12 +57,15 @@ python .\codex_session_relay.py --port 9000
 `config.toml` 示例：
 
 ```toml
-model = "gpt-5.5"
+model_provider = "local_codex_relay"
+disable_response_storage = true
 
-[model_providers.openai]
-name = "local-codex-relay"
+[model_providers]
+[model_providers.local_codex_relay]
+name = "local_codex_relay"
 base_url = "http://127.0.0.1:8765/backend-api/codex"
 wire_api = "responses"
+requires_openai_auth = true
 ```
 
 `auth.json` 示例：
