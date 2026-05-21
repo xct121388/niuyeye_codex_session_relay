@@ -626,11 +626,14 @@ def build_config_examples(base_url: str) -> dict[str, str]:
     codex_base = base_url.rstrip("/") + "/backend-api/codex"
     return {
         "recommended_toml": (
-            f'model = "{CC_SWITCH_CODEX_MODEL}"\n\n'
-            "[model_providers.openai]\n"
-            'name = "local-codex-relay"\n'
+            'model_provider = "local_codex_relay"\n'
+            "disable_response_storage = true\n\n"
+            "[model_providers]\n"
+            "[model_providers.local_codex_relay]\n"
+            'name = "local_codex_relay"\n'
             f'base_url = "{codex_base}"\n'
             'wire_api = "responses"\n'
+            "requires_openai_auth = true\n"
         ),
         "auth_json": json.dumps({"OPENAI_API_KEY": LOCAL_API_KEY}, ensure_ascii=False, indent=2),
     }
