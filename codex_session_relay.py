@@ -1866,7 +1866,8 @@ class SettingsWindow:
         self.window.lift(app.root)
         self.window.focus_force()
         self.port_var = tk.StringVar(value=str(app.port))
-        self.startup_var = tk.BooleanVar(value=is_startup_enabled())
+        self.current_startup = is_startup_enabled()
+        self.startup_var = tk.BooleanVar(value=self.current_startup)
         close_action = string_value(app.settings.get("close_action")) or CLOSE_ACTION_EXIT
         self.exit_on_close_var = tk.BooleanVar(value=close_action == CLOSE_ACTION_EXIT)
         self.minimize_on_close_var = tk.BooleanVar(value=close_action == CLOSE_ACTION_MINIMIZE)
@@ -1926,7 +1927,9 @@ class SettingsWindow:
         close_action = CLOSE_ACTION_MINIMIZE if self.minimize_on_close_var.get() else CLOSE_ACTION_EXIT
         try:
             self.app.restart_server(port)
-            set_startup_enabled(startup)
+            if startup != self.current_startup:
+                set_startup_enabled(startup)
+                self.current_startup = startup
             self.app.settings.update({"port": port, "startup": startup, "close_action": close_action})
             save_settings(self.app.store_path, self.app.settings)
         except Exception as exc:
